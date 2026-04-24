@@ -61,13 +61,23 @@ if prompt := st.chat_input("What is up?"):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    stream = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
+    stream = client.responses.create(
+        model="gpt-5.4",
+        input=[
             {"role": m["role"], "content": m["content"]}
             for m in st.session_state.messages
         ],
         stream=True,
+        format={"type": "text"},
+        tool_choice="required",
+        temperature=0,
+        max_output_tokens=32768,
+        top_p=1,
+        reasoning={"effort": "none"},
+        tools=[{
+            "type": "file_search",
+            "vector_store_ids": ["vs_69eb029ecadc8191b1c321b5d58f1958"],
+        }],
     )
 
     with st.chat_message("assistant"):

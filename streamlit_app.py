@@ -72,8 +72,11 @@ if prompt := st.chat_input("What is up?"):
 
     # Stream the assistant response.
     with st.chat_message("assistant"):
-        placeholder = st.empty()
+        text_placeholder = st.empty()
+        sources_placeholder = st.empty()
+
         full_response = ""
+        file_search_results = []
 
         stream = client.responses.create(
             model="gpt-5.4",
@@ -92,12 +95,40 @@ if prompt := st.chat_input("What is up?"):
                 "type": "file_search",
                 "vector_store_ids": ["vs_69eb029ecadc8191b1c321b5d58f1958"],
             }],
+            include=["file_search_call.results"],
         )
 
         for event in stream:
             if event.type == "response.output_text.delta":
                 full_response += event.delta
-                placeholder.markdown(full_response)
+                text_placeholder.markdown(full_response)
+
+            elif event.type == "response.output_item.done":
+                item = event.item
+
+                if item.type == "file_search_call":
+                    results = getattr(item, "results", None) or []
+                    file_search_results.extend(results)
+
+        text_placeholder.markdown(full_response)
+
+        # Render retrieved chunks/documents underneath
+        if file_search_results:
+            with sources_placeholder.container():
+                with st.expander("Sources from file search"):
+                    for i, result in enumerate(file_search_results, start=1):
+                        filename = getattr(result, "filename", "Unknown file")
+                        score = getattr(result, "score", None)
+                        text = getattr(result, "text", "")
+
+                        st.markdown(f"**{i}. {filename}**")
+                        if score is not None:
+                            st.caption(f"Score: {score}")
+
+                        if text:
+                            st.write(text)
+
+                        st.divider()
 
     # Store assistant response in session state.
     st.session_state.messages.append(

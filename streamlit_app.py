@@ -54,33 +54,52 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Chat input.
+ # Chat input.
 if prompt := st.chat_input("What is up?"):
+    # Store and display the user message.
     st.session_state.messages.append({"role": "user", "content": prompt})
-
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    stream = client.responses.create(
-        model="gpt-5.4",
-        input=[
-            {"role": m["role"], "content": m["content"]}
-            for m in st.session_state.messages
-        ],
-        stream=True,
-        format={"type": "text"},
-        tool_choice="required",
-        temperature=0,
-        max_output_tokens=32768,
-        top_p=1,
-        reasoning={"effort": "none"},
-        tools=[{
-            "type": "file_search",
-            "vector_store_ids": ["vs_69eb029ecadc8191b1c321b5d58f1958"],
-        }],
-    )
+    # Convert chat history into Responses API input items.
+    response_input = [
+        {
+            "role": message["role"],
+            "content": [{"type": "input_text", "text": message["content"]}],
+        }
+        for message in st.session_state.messages
+    ]
 
+    # Stream the assistant response.
     with st.chat_message("assistant"):
-        response = st.write_stream(stream)
+        placeholder = st.empty()
+        full_response = ""
 
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        stream = client.responses.create(
+            model="gpt-5.4",
+            input=[
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages
+            ],
+            stream=True,
+            text={"format": {"type": "text"}},
+            tool_choice="required",
+            temperature=0,
+            max_output_tokens=32768,
+            top_p=1,
+            reasoning={"effort": "none"},
+            tools=[{
+                "type": "file_search",
+                "vector_store_ids": ["vs_69eb029ecadc8191b1c321b5d58f1958"],
+            }],
+        )
+
+        for event in stream:
+            if event.type == "response.output_text.delta":
+                full_response += event.delta
+                placeholder.markdown(full_response)
+
+    # Store assistant response in session state.
+    st.session_state.messages.append(
+        {"role": "assistant", "content": full_response}
+    )

@@ -85,7 +85,7 @@ if st.session_state.authenticated:
                         score = getattr(result, "score", None)
                         text = getattr(result, "text", "") or ""
 
-                        preview = text[:300].strip()
+                        preview = text.strip()
                         line = f"{i}. **{filename}**"
                         if score is not None:
                             line += f" (score: {score:.3f})"
@@ -108,7 +108,7 @@ if st.session_state.authenticated:
                             score = getattr(result, "score", None)
                             text = getattr(result, "text", "") or ""
 
-                            preview = text[:300].strip()
+                            preview = text.strip()
                             line = f"{i}. **{filename}**"
                             if score is not None:
                                 line += f" (score: {score:.3f})"

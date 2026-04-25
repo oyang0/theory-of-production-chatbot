@@ -97,7 +97,7 @@ if prompt := st.chat_input("What is up?"):
             }
         ],
         include=["file_search_call.results"],
-        tool_choice={"type": "required"},
+        tool_choice="required",
     )
 
     def serialize(obj):

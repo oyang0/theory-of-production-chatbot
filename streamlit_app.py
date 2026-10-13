@@ -105,6 +105,7 @@ if prompt:
                 {
                     "type": "file_search",
                     "vector_store_ids": [vector_store_id],
+                    "max_num_results": 50,
                 }
             ],
             "include": ["file_search_call.results"],

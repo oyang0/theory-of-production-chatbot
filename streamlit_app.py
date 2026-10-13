@@ -130,13 +130,14 @@ def create_research_response(
     if effort not in SUPPORTED_SETTINGS.get(mode, set()):
         raise ValueError("Unsupported research mode and reasoning effort.")
 
-    # Pro mode is deliberately blocked above. Do not substitute an effort
-    # value for the API's actual reasoning-mode parameter.
     return client.responses.create(
         model=MODEL,
         instructions=RESEARCH_INSTRUCTIONS,
         input=messages,
-        reasoning={"effort": effort},
+        reasoning={
+            "mode": mode,
+            "effort": effort,
+        },
         tools=[
             {
                 "type": "file_search",
@@ -186,17 +187,10 @@ if (
     st.session_state.messages = []
 
 if effort not in SUPPORTED_SETTINGS.get(mode, set()):
-    if mode == "pro":
-        st.warning(
-            "Pro mode is unavailable in this version of the app. Its exact "
-            "Responses API parameter and supported efforts must be verified "
-            "against the current SDK documentation before requests can be sent."
-        )
-    else:
-        st.warning(
-            f"{MODEL} does not support reasoning effort '{effort}' in the "
-            "configured compatibility table. Choose a supported effort."
-        )
+    st.warning(
+        f"{MODEL} does not support reasoning effort '{effort}' in the "
+        "configured compatibility table. Choose a supported effort."
+    )
     st.stop()
 
 client = OpenAI(api_key=api_key)

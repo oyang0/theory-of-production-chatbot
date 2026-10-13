@@ -130,7 +130,7 @@ def create_research_response(
     if effort not in SUPPORTED_SETTINGS.get(mode, set()):
         raise ValueError("Unsupported research mode and reasoning effort.")
 
-    return client.responses.create(
+    return client.with_options(timeout=900.0).responses.create(
         model=MODEL,
         instructions=RESEARCH_INSTRUCTIONS,
         input=messages,
@@ -138,6 +138,8 @@ def create_research_response(
             "mode": mode,
             "effort": effort,
         },
+        text={"verbosity": "high"},
+        temperature=0 if mode == "none" else 1,
         tools=[
             {
                 "type": "file_search",
@@ -145,6 +147,7 @@ def create_research_response(
             }
         ],
         include=["file_search_call.results"],
+        service_tier="flex",
     )
 
 
@@ -193,7 +196,7 @@ if effort not in SUPPORTED_SETTINGS.get(mode, set()):
     )
     st.stop()
 
-client = OpenAI(api_key=api_key)
+client = OpenAI(api_key=api_key, timeout=900.0)
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):

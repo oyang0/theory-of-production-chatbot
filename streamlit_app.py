@@ -1,158 +1,194 @@
+import hmac
+
 import streamlit as st
 from openai import OpenAI
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's model to generate responses. "
-    "To use this app, you need an OpenAI API key configured in Streamlit secrets."
-)
+st.set_page_config(page_title="Book research", page_icon="📚")
+st.title("📚 Book research")
 
-# Read secrets from ./.streamlit/secrets.toml
-try:
-    openai_api_key = st.secrets["OPENAI_API_KEY"]
-    app_password = st.secrets["APP_PASSWORD"]
-    vector_store_id = st.secrets["VECTOR_STORE_ID"]
-except FileNotFoundError:
+# Explicit, conservative capability configuration. Update only after checking
+# the current model documentation for the model you deploy.
+MODEL = "gpt-6-sol"
+SUPPORTED_STANDARD_EFFORTS = {"none"}
+EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
+
+INSTRUCTIONS = """
+You are a research assistant working with the uploaded books.
+Use file_search to investigate the user's question. Give a comprehensive,
+well-organized answer grounded in retrieved material. Cite the relevant
+retrieved files for substantive claims. Distinguish what the books establish
+from your interpretation, outside knowledge, and uncertainty. If retrieval
+does not support an answer, say so. Never invent quotations, page numbers,
+passages, or citations. Page markers in a retrieved excerpt may help locate
+text, but do not claim an exact page unless the retrieved text establishes it.
+"""
+
+
+def secret(name: str) -> str | None:
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        return None
+    return value if isinstance(value, str) and value.strip() else None
+
+
+app_password = secret("APP_PASSWORD")
+api_key = secret("OPENAI_API_KEY")
+vector_store_id = secret("OPENAI_VECTOR_STORE_ID")
+
+if not app_password or not api_key or not vector_store_id:
     st.error(
-        "Secrets file not found. Create `./.streamlit/secrets.toml` "
-        "and add `OPENAI_API_KEY`, `APP_PASSWORD`, and `VECTOR_STORE_ID`."
+        "App configuration is incomplete. Ask the operator to set "
+        "APP_PASSWORD, OPENAI_API_KEY, and OPENAI_VECTOR_STORE_ID in "
+        ".streamlit/secrets.toml."
     )
     st.stop()
-except KeyError as e:
-    st.error(f"Missing secret: {e}")
-    st.stop()
 
-# Ask user for the app password via st.text_input.
-entered_password = st.text_input("Password", type="password")
-
+# A keyed widget is necessary for Streamlit input, but its value is never
+# copied into messages or sent to OpenAI.
+entered_password = st.text_input("App password", type="password", key="app_password")
 if not entered_password:
-    st.info("Please enter the app password to continue.", icon="🔐")
+    st.info("Enter the app password to continue.")
+    st.stop()
+if not hmac.compare_digest(entered_password, app_password):
+    st.error("Incorrect app password.")
     st.stop()
 
-if entered_password != app_password:
-    st.error("Incorrect password.")
-    st.stop()
+# No client or chat controls exist before successful authentication.
+client = OpenAI(api_key=api_key)
 
-# Create an OpenAI client.
-client = OpenAI(api_key=openai_api_key)
+mode = st.selectbox("Reasoning mode", ["standard", "pro"])
+effort = st.selectbox("Reasoning effort", EFFORTS, index=0)
 
-# Create session state variables.
+configuration_error = None
+if mode == "pro":
+    configuration_error = (
+        "Pro mode is unavailable in this deployment: its current model-specific "
+        "API configuration has not been verified. It is not a reasoning.effort value."
+    )
+elif effort not in SUPPORTED_STANDARD_EFFORTS:
+    configuration_error = (
+        f"{MODEL} is configured here only for verified effort 'none'. "
+        f"'{effort}' has not been verified for this deployment. "
+        "The operator must check the current model documentation and update "
+        "the explicit capability configuration before enabling it."
+    )
+
+if configuration_error:
+    st.warning(configuration_error)
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "response_id" not in st.session_state:
+    st.session_state.response_id = None
 
-if "debug_items" not in st.session_state:
-    st.session_state.debug_items = []
-
-# Display the existing chat messages via st.chat_message.
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message.get("sources"):
+            st.caption("Cited files: " + "; ".join(message["sources"]))
 
-        # Optionally show previous search results / annotations.
-        if message["role"] == "assistant":
-            if message.get("file_search_results"):
-                with st.expander("Search results"):
-                    st.json(message["file_search_results"])
+prompt = st.chat_input(
+    "Ask about the uploaded books",
+    disabled=configuration_error is not None,
+)
 
-            if message.get("annotations"):
-                with st.expander("Annotations"):
-                    st.json(message["annotations"])
-
-# Create a chat input field.
-if prompt := st.chat_input("What is up?"):
-
-    # Store and display the current prompt.
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    )
-
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Containers for metadata captured during streaming.
-    annotations = []
-    file_search_results = []
-    raw_events = []
+    try:
+        # Check readiness at query time as well as during ingestion. This
+        # prevents queries against a store with pending or failed files.
+        files = list(
+            client.vector_stores.files.list(vector_store_id=vector_store_id)
+        )
+        if not files:
+            st.error("The configured vector store contains no indexed books.")
+            st.stop()
+        unfinished = [f for f in files if f.status != "completed"]
+        if unfinished:
+            st.error(
+                "Book indexing is not complete. Ask the operator to check "
+                "the ingestion command and retry when all files are completed."
+            )
+            st.stop()
 
-    # Generate a response using the OpenAI API.
-    stream = client.responses.create(
-        model="gpt-5.6",
-        input=[
-            {"role": m["role"], "content": m["content"]}
-            for m in st.session_state.messages
-            if m["role"] in ("user", "assistant")
-        ],
-        stream=True,
-        reasoning={"effort": "none"},
-        temperature=0,
-        max_output_tokens=32768,
-        tools=[
-            {
-                "type": "file_search",
-                "vector_store_ids": [vector_store_id],
-            }
-        ],
-        include=["file_search_call.results"],
-        tool_choice="required",
-    )
-
-    def serialize(obj):
-        """
-        Best-effort helper to convert OpenAI SDK objects into JSON-serializable dicts.
-        """
-        if hasattr(obj, "model_dump"):
-            return obj.model_dump()
-        if hasattr(obj, "dict"):
-            return obj.dict()
-        return obj
-
-    def write_stream():
-        for event in stream:
-            raw_events.append(serialize(event))
-
-            # Stream assistant text.
-            if event.type == "response.output_text.delta":
-                yield event.delta
-
-            # Capture annotations as they are added.
-            elif event.type == "response.output_text.annotation.added":
-                annotations.append(serialize(event.annotation))
-
-            # Capture file search result events, if surfaced during streaming.
-            elif event.type in (
-                "response.file_search_call.completed",
-                "response.file_search_call.in_progress",
-                "response.file_search_call.searching",
-            ):
-                file_search_results.append(serialize(event))
-
-    # Stream the response to the chat, then store it in session state.
-    with st.chat_message("assistant"):
-        response_text = st.write_stream(write_stream())
-
-        # Write annotations to the chat.
-        if annotations:
-            with st.expander("Annotations"):
-                st.json(annotations)
-
-        # Write search results to the chat.
-        if file_search_results:
-            with st.expander("Search results"):
-                st.json(file_search_results)
-
-        # Optional: useful while developing/debugging.
-        # with st.expander("Raw stream events"):
-        #     st.json(raw_events)
-
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": response_text,
-            "annotations": annotations,
-            "file_search_results": file_search_results,
+        request = {
+            "model": MODEL,
+            "instructions": INSTRUCTIONS,
+            "input": prompt,
+            "reasoning": {"effort": effort},
+            "tools": [
+                {
+                    "type": "file_search",
+                    "vector_store_ids": [vector_store_id],
+                }
+            ],
+            "include": ["file_search_call.results"],
         }
-    )
+        if st.session_state.response_id:
+            request["previous_response_id"] = st.session_state.response_id
+
+        response = client.responses.create(**request)
+
+        search_calls = [
+            item for item in response.output
+            if item.type == "file_search_call"
+        ]
+        results = [
+            result
+            for call in search_calls
+            for result in (call.results or [])
+        ]
+        if not results:
+            answer = (
+                "No book passages were retrieved for this question. "
+                "Try a more specific query or ask the operator to check indexing."
+            )
+            sources = []
+        else:
+            answer = response.output_text or (
+                "The search returned passages, but the model produced no answer."
+            )
+            # Annotations are the API's citation records. Do not infer pages
+            # from filenames or from the model's prose.
+            sources = []
+            for item in response.output:
+                if item.type != "message":
+                    continue
+                for part in item.content:
+                    if part.type != "output_text":
+                        continue
+                    for annotation in part.annotations or []:
+                        if annotation.type == "file_citation":
+                            label = (
+                                f"{annotation.filename} "
+                                f"(OpenAI file ID: {annotation.file_id})"
+                            )
+                            if label not in sources:
+                                sources.append(label)
+
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+            if sources:
+                st.caption("Cited files: " + "; ".join(sources))
+            elif results:
+                st.warning(
+                    "Passages were retrieved, but the answer has no file "
+                    "citation annotations. Verify it against the books."
+                )
+
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer, "sources": sources}
+        )
+        st.session_state.response_id = response.id
+
+    except Exception:
+        # Avoid displaying exception text: SDK errors can contain request
+        # details. Operators should inspect protected server logs instead.
+        st.error(
+            "The research request failed. Check API access, model support, "
+            "vector-store configuration, and server logs."
+        )

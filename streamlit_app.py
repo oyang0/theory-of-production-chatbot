@@ -60,23 +60,6 @@ client = OpenAI(api_key=api_key)
 mode = st.selectbox("Reasoning mode", ["standard", "pro"])
 effort = st.selectbox("Reasoning effort", EFFORTS, index=0)
 
-configuration_error = None
-if mode == "pro":
-    configuration_error = (
-        "Pro mode is unavailable in this deployment: its current model-specific "
-        "API configuration has not been verified. It is not a reasoning.effort value."
-    )
-elif effort not in SUPPORTED_STANDARD_EFFORTS:
-    configuration_error = (
-        f"{MODEL} is configured here only for verified effort 'none'. "
-        f"'{effort}' has not been verified for this deployment. "
-        "The operator must check the current model documentation and update "
-        "the explicit capability configuration before enabling it."
-    )
-
-if configuration_error:
-    st.warning(configuration_error)
-
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "response_id" not in st.session_state:
@@ -88,10 +71,7 @@ for message in st.session_state.messages:
         if message.get("sources"):
             st.caption("Cited files: " + "; ".join(message["sources"]))
 
-prompt = st.chat_input(
-    "Ask about the uploaded books",
-    disabled=configuration_error is not None,
-)
+prompt = st.chat_input("Ask about the uploaded books")
 
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})

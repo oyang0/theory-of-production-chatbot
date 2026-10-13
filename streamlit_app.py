@@ -1,176 +1,247 @@
+import hashlib
 import hmac
 import re
 
 import streamlit as st
 from openai import OpenAI
 
+
 MODEL = "gpt-6-sol"
-EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
-PAGE_MARKER = re.compile(r"\[PAGE_NUMBER\]\s*\n-{48}")
+
+SUPPORTED_SETTINGS = {
+    "standard": {"none", "low", "medium", "high", "xhigh", "max"},
+    "pro": {"none", "low", "medium", "high", "xhigh", "max"},
+}
+
+PAGE_MARKER_RE = re.compile(r"\n\n\[(\d+)\]-{48}\n\n")
 
 RESEARCH_INSTRUCTIONS = """
-You are a deep-research assistant working with books in the attached vector store.
-Produce a comprehensive, research-analyst-level answer grounded in relevant
-retrieved passages. Distinguish what the authors claim from your own analysis.
-Use short, accurate quotations when useful, and cite the files supporting
-substantive claims. Do not invent quotations, page numbers, or citations.
+You are a research analyst working primarily from the uploaded Markdown books.
 
-The Markdown books use page separators consisting of two newlines,
-[PAGE_NUMBER], 48 hyphens, and two newlines. Treat a page number as verified
-only if it appears explicitly in retrieved text and its relationship to the
-quoted passage is clear. Never infer a page number from a citation annotation,
-filename, or search-result position. If a page boundary makes a quotation's
-page ambiguous, cite the file without a page number. If the retrieved material
-does not support an answer, say so.
+For substantive research questions, use file_search. Give comprehensive,
+carefully reasoned answers grounded in retrieved evidence. Distinguish what
+the books say from your own interpretation or synthesis. Identify material
+gaps, uncertainty, and disagreements between sources.
+
+Cite the relevant retrieved files close to the claims they support. Include
+short, relevant quotations when the retrieved text lets you verify their
+exact wording and attribution. Never invent a quotation, page number, line
+number, or source.
+
+The books use page-boundary markers consisting of two newlines, a bracketed
+page number, 48 hyphens, and two newlines. These are metadata, not prose.
+A retrieved excerpt may cross a boundary. Give a page number only when the
+retrieved evidence unambiguously establishes that the cited passage is on
+that page. Otherwise cite the file without a page number. If the available
+retrieved text cannot verify a quotation, paraphrase instead.
+
+Use the file-search citation annotations supplied by the API. Do not invent
+citation markers or claim that a citation links to a particular page.
 """
 
 
-def get_secrets():
-    names = ("APP_PASSWORD", "OPENAI_API_KEY", "VECTOR_STORE_ID")
-    missing = [name for name in names if not st.secrets.get(name)]
-    if missing:
-        st.error("Missing required secrets: " + ", ".join(missing))
-        st.stop()
-    return {name: st.secrets[name] for name in names}
-
-
-def validate_settings(mode, effort):
-    if mode == "pro":
-        return (
-            f"`pro` is not a supported API mode established for {MODEL}. "
-            "Select `standard` to send a request."
+def required_secret(name: str) -> str:
+    try:
+        value = st.secrets[name]
+    except (KeyError, FileNotFoundError):
+        st.error(
+            f"Missing configuration: {name}. Add it to "
+            "./.streamlit/secrets.toml and restart the app."
         )
-    if effort not in EFFORTS:
-        return "Select a supported reasoning effort."
-    return None
+        st.stop()
+
+    if not isinstance(value, str) or not value.strip():
+        st.error(f"Configuration error: {name} must be a non-empty string.")
+        st.stop()
+
+    return value
 
 
-def extract_answer(response):
-    """Keep the API's citation annotations alongside the displayed answer."""
-    parts = []
-    citations = []
+def session_fingerprint(password: str, vector_store_id: str) -> str:
+    """Identify this authenticated session without storing its password."""
+    return hashlib.sha256(
+        (password + "\0" + vector_store_id).encode("utf-8")
+    ).hexdigest()
 
-    for item in response.output or []:
+
+def response_text_and_sources(response):
+    """Extract answer text and API-provided file citation annotations."""
+    text_parts = []
+    sources = []
+    seen = set()
+
+    for item in response.output:
         if getattr(item, "type", None) != "message":
             continue
-        for content in getattr(item, "content", []) or []:
+
+        for content in getattr(item, "content", []):
             if getattr(content, "type", None) != "output_text":
                 continue
-            text = getattr(content, "text", "") or ""
-            if text:
-                parts.append(text)
+
+            text_parts.append(content.text)
             for annotation in getattr(content, "annotations", []) or []:
-                if getattr(annotation, "type", None) == "file_citation":
-                    citations.append(
+                if getattr(annotation, "type", None) != "file_citation":
+                    continue
+
+                file_id = getattr(annotation, "file_id", None)
+                filename = getattr(annotation, "filename", None)
+                key = (file_id, filename)
+                if key not in seen:
+                    seen.add(key)
+                    sources.append(
                         {
-                            "file_id": getattr(annotation, "file_id", None),
-                            "filename": getattr(annotation, "filename", None),
-                            "index": getattr(annotation, "index", None),
+                            "file_id": file_id,
+                            "filename": filename or "Untitled file",
                         }
                     )
 
-    # output_text is convenient, but the content blocks above are needed
-    # to retain citation metadata for later Streamlit reruns.
-    answer = "\n\n".join(parts).strip() or (response.output_text or "").strip()
-    unique = list(dict.fromkeys(
-        (c["file_id"], c["filename"], c["index"]) for c in citations
-    ))
-    return answer, [
-        {"file_id": file_id, "filename": filename, "index": index}
-        for file_id, filename, index in unique
-    ]
+    return "\n".join(text_parts).strip(), sources
 
 
-def show_message(message):
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message["role"] == "assistant" and message.get("citations"):
-            with st.expander("Cited files"):
-                for citation in message["citations"]:
-                    name = citation["filename"] or "Untitled file"
-                    file_id = citation["file_id"]
-                    st.write(f"{name} — file ID: `{file_id}`" if file_id else name)
+def display_answer(text: str, sources: list[dict]):
+    # File-search citation markers are API presentation tokens, not prose.
+    # Streamlit Markdown does not resolve them into clickable file citations.
+    # Remove only the known file-citation token shape; retain the API's
+    # annotation metadata in the source list below.
+    clean_text = re.sub(r"filecite[^]+", "", text)
+    st.markdown(clean_text)
+
+    if sources:
+        st.caption(
+            "Cited files: "
+            + "; ".join(
+                f"{source['filename']} ({source['file_id']})"
+                for source in sources
+            )
+        )
+        st.caption(
+            "These citations identify uploaded files. This app cannot link "
+            "directly to a book page from the file-search annotations."
+        )
 
 
-st.title("📚 Deep-research assistant")
+def create_research_response(
+    client: OpenAI,
+    messages: list[dict],
+    vector_store_id: str,
+    mode: str,
+    effort: str,
+):
+    if effort not in SUPPORTED_SETTINGS.get(mode, set()):
+        raise ValueError("Unsupported research mode and reasoning effort.")
+
+    # Pro mode is deliberately blocked above. Do not substitute an effort
+    # value for the API's actual reasoning-mode parameter.
+    return client.responses.create(
+        model=MODEL,
+        instructions=RESEARCH_INSTRUCTIONS,
+        input=messages,
+        reasoning={"effort": effort},
+        tools=[
+            {
+                "type": "file_search",
+                "vector_store_ids": [vector_store_id],
+            }
+        ],
+        include=["file_search_call.results"],
+    )
+
+
+st.title("📚 Book-Grounded Research Chat")
 st.write(
-    "Ask research questions about the books in the configured knowledge base. "
-    "Answers use hosted file search and retain cited-file details in this session."
+    "Ask detailed questions about the uploaded books. Answers use hosted "
+    "file search and identify the files supporting their claims."
 )
 
-secrets = get_secrets()
+app_password = required_secret("APP_PASSWORD")
+api_key = required_secret("OPENAI_API_KEY")
+vector_store_id = required_secret("VECTOR_STORE_ID")
 
-# A keyed widget is cleared after successful authentication. The password is
-# never added to the conversation or sent to the model.
-if not st.session_state.get("authenticated", False):
-    entered = st.text_input("App password", type="password", key="app_password")
-    if st.button("Unlock"):
-        if hmac.compare_digest(entered, secrets["APP_PASSWORD"]):
-            st.session_state.authenticated = True
-            del st.session_state["app_password"]
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
+entered_password = st.text_input("App password", type="password")
+
+if not entered_password:
+    st.info("Enter the app password to begin.")
     st.stop()
 
-mode = st.selectbox("Reasoning mode", ("standard", "pro"))
-effort = st.selectbox("Reasoning effort", EFFORTS, index=2)
-settings_error = validate_settings(mode, effort)
-if settings_error:
-    st.warning(settings_error)
+if not hmac.compare_digest(entered_password, app_password):
+    st.error("Incorrect password.")
+    st.stop()
 
-if "messages" not in st.session_state:
+mode = st.selectbox("Reasoning mode", ["standard", "pro"])
+effort = st.selectbox(
+    "Reasoning effort",
+    ["none", "low", "medium", "high", "xhigh", "max"],
+    index=2,
+)
+
+fingerprint = session_fingerprint(entered_password, vector_store_id)
+settings = (MODEL, mode, effort, vector_store_id)
+
+if (
+    st.session_state.get("research_session") != fingerprint
+    or st.session_state.get("research_settings") != settings
+):
+    st.session_state.research_session = fingerprint
+    st.session_state.research_settings = settings
     st.session_state.messages = []
-if "previous_response_id" not in st.session_state:
-    st.session_state.previous_response_id = None
+
+if effort not in SUPPORTED_SETTINGS.get(mode, set()):
+    if mode == "pro":
+        st.warning(
+            "Pro mode is unavailable in this version of the app. Its exact "
+            "Responses API parameter and supported efforts must be verified "
+            "against the current SDK documentation before requests can be sent."
+        )
+    else:
+        st.warning(
+            f"{MODEL} does not support reasoning effort '{effort}' in the "
+            "configured compatibility table. Choose a supported effort."
+        )
+    st.stop()
+
+client = OpenAI(api_key=api_key)
 
 for message in st.session_state.messages:
-    show_message(message)
+    with st.chat_message(message["role"]):
+        if message["role"] == "assistant":
+            display_answer(message["content"], message.get("sources", []))
+        else:
+            st.markdown(message["content"])
 
-prompt = st.chat_input("Ask about the books", disabled=bool(settings_error))
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    show_message(st.session_state.messages[-1])
+if prompt := st.chat_input("Ask a research question about the books"):
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    request_messages = [
+        {"role": message["role"], "content": message["content"]}
+        for message in st.session_state.messages
+    ]
+    request_messages.append({"role": "user", "content": prompt})
 
     try:
-        # Construct the client only after authentication.
-        client = OpenAI(api_key=secrets["OPENAI_API_KEY"], timeout=900.0)
-        request = {
-            "model": MODEL,
-            "instructions": RESEARCH_INSTRUCTIONS,
-            "input": prompt,
-            "reasoning": {"effort": effort},
-            "text": {"verbosity": "high"},
-            "temperature": 0 if effort == "none" else 1,
-            "tools": [
-                {
-                    "type": "file_search",
-                    "vector_store_ids": [secrets["VECTOR_STORE_ID"]],
-                }
-            ],
-            "include": ["file_search_call.results"],
-            "service_tier": "flex",
-        }
-        if st.session_state.previous_response_id:
-            request["previous_response_id"] = st.session_state.previous_response_id
-
-        with st.spinner("Researching the books…"):
-            response = client.with_options(timeout=900.0).responses.create(**request)
-
-        if getattr(response, "status", None) == "incomplete":
-            st.error("The research response was incomplete. Please try again.")
-        else:
-            answer, citations = extract_answer(response)
+        with st.spinner("Searching the books and preparing an answer…"):
+            response = create_research_response(
+                client, request_messages, vector_store_id, mode, effort
+            )
+            answer, sources = response_text_and_sources(response)
             if not answer:
-                st.error("The API returned no answer. Please try again.")
-            else:
-                assistant_message = {
-                    "role": "assistant",
-                    "content": answer,
-                    "citations": citations,
-                }
-                st.session_state.messages.append(assistant_message)
-                st.session_state.previous_response_id = response.id
-                show_message(assistant_message)
-    except Exception as exc:
-        st.error(f"Research request failed: {exc}")
+                raise RuntimeError("The API returned no answer text.")
+    except Exception:
+        # Do not display exception text: it may contain request details.
+        st.error(
+            "The research request failed. Check the app configuration, "
+            "model access, and vector-store availability in server logs."
+        )
+    else:
+        st.session_state.messages.append(
+            {"role": "user", "content": prompt}
+        )
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "sources": sources,
+            }
+        )
+        with st.chat_message("assistant"):
+            display_answer(answer, sources)

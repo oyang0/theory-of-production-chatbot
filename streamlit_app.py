@@ -9,7 +9,6 @@ st.title("📚 Book research")
 # Explicit, conservative capability configuration. Update only after checking
 # the current model documentation for the model you deploy.
 MODEL = "gpt-6-sol"
-SUPPORTED_STANDARD_EFFORTS = {"none"}
 EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
 
 INSTRUCTIONS = """
@@ -55,7 +54,7 @@ if not hmac.compare_digest(entered_password, app_password):
     st.stop()
 
 # No client or chat controls exist before successful authentication.
-client = OpenAI(api_key=api_key)
+client = OpenAI(api_key=api_key, timeout=900.0)
 
 mode = st.selectbox("Reasoning mode", ["standard", "pro"])
 effort = st.selectbox("Reasoning effort", EFFORTS, index=0)
@@ -100,6 +99,8 @@ if prompt:
             "instructions": INSTRUCTIONS,
             "input": prompt,
             "reasoning": {"effort": effort},
+            "text": {"verbosity": "high"},
+            "temperature": 0 if effort == "none" else 1,
             "tools": [
                 {
                     "type": "file_search",
@@ -107,11 +108,12 @@ if prompt:
                 }
             ],
             "include": ["file_search_call.results"],
+            "service_tier": "flex",
         }
         if st.session_state.response_id:
             request["previous_response_id"] = st.session_state.response_id
 
-        response = client.responses.create(**request)
+        response = client.with_options(timeout=900.0).responses.create(**request)
 
         search_calls = [
             item for item in response.output

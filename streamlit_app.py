@@ -262,12 +262,8 @@ def show_message(message):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant" and message.get("sources"):
-            with st.expander("Sources"):
-                for chunk in message["sources"]:
-                    st.markdown(
-                        f"**{chunk['id']} — {chunk['filename']} "
-                        f"({chunk['page']})**"
-                    )
+            for chunk in message["sources"]:
+                with st.expander(f"{chunk['id']} — {chunk['filename']} ({chunk['page']})"):
                     st.text(chunk["text"])
 
 

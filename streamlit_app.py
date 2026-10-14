@@ -4,9 +4,10 @@ import re
 import streamlit as st
 from openai import OpenAI
 
-MODEL = "gpt-6-astra"
+MODEL = "gpt-6-sol"
 MAX_SEARCH_ROUNDS = 3
-MAX_RESULTS_PER_SEARCH = 10
+MAX_RESULTS_PER_SEARCH = 50
+SCORE_THRESHOLD = 0.5
 MAX_GROUNDING_CHARS = 60_000
 
 # A page boundary is two newlines, [PAGE_NUMBER] plus 48 hyphens,
@@ -92,18 +93,24 @@ def search_collection(client, vector_store_id, messages):
         "in the retrieved chunks."
     )
 
-    response = client.responses.create(
+    response = client.with_options(timeout=900.0).responses.create(
         model=MODEL,
         instructions=research_instructions,
         input=context,
+        reasoning={"effort": "none"},
+        text={"verbosity": "high"},
+        temperature=0,
+        max_output_tokens=32768,
         tools=[
             {
                 "type": "file_search",
                 "vector_store_ids": [vector_store_id],
                 "max_num_results": MAX_RESULTS_PER_SEARCH,
+                "ranking_options": {"score_threshold": SCORE_THRESHOLD},
             }
         ],
         include=["file_search_call.results"],
+        service_tier="flex",
     )
     collect_chunks(response, chunks, seen)
 
@@ -131,14 +138,20 @@ def search_collection(client, vector_store_id, messages):
                 f"Research focus: {focus}\n"
                 f"Current question: {question}"
             ),
+            reasoning={"effort": "none"},
+            text={"verbosity": "high"},
+            temperature=0,
+            max_output_tokens=32768,
             tools=[
                 {
                     "type": "file_search",
                     "vector_store_ids": [vector_store_id],
                     "max_num_results": MAX_RESULTS_PER_SEARCH,
+                    "ranking_options": {"score_threshold": SCORE_THRESHOLD},
                 }
             ],
             include=["file_search_call.results"],
+            service_tier="flex",
         )
         collect_chunks(follow_up, chunks, seen)
 
@@ -181,7 +194,7 @@ def grounded_answer(client, messages, chunks):
     selected = grounding_material(chunks)
     if not selected:
         return (
-            "I couldn’t access enough retrieved chunk text to give a "
+            "I couldn't access enough retrieved chunk text to give a "
             "verifiable answer. Please try a narrower question.",
             [],
         )
@@ -216,11 +229,16 @@ def grounded_answer(client, messages, chunks):
         f"Retrieved chunks (the only citable sources):\n{sources}"
     )
 
-    for attempt in range(2):
+    for _ in range(2):
         response = client.responses.create(
             model=MODEL,
             instructions=instructions,
             input=prompt,
+            reasoning={"effort": "none"},
+            text={"verbosity": "high"},
+            temperature=0,
+            max_output_tokens=32768,
+            service_tier="flex",
         )
         answer = (response.output_text or "").strip()
         if validate_answer(answer, selected):
@@ -234,7 +252,7 @@ def grounded_answer(client, messages, chunks):
         )
 
     return (
-        "I found retrieved material, but couldn’t produce an answer with "
+        "I found retrieved material, but couldn't produce an answer with "
         "validated block-level citations. Please try a narrower question.",
         [],
     )
@@ -276,7 +294,7 @@ if not hashlib.compare_digest(password, expected_password):
     st.stop()
 
 # Authentication has succeeded; only now create the client and show the chat.
-client = OpenAI(api_key=api_key)
+client = OpenAI(api_key=api_key, timeout=900.0)
 st.caption("Ask questions about the books in the existing research collection.")
 
 if "messages" not in st.session_state:

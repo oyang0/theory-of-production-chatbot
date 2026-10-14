@@ -1,202 +1,311 @@
+import hashlib
 import re
-from pathlib import Path
 
 import streamlit as st
 from openai import OpenAI
 
-MODEL = "gpt-6-sol"
-PAGE_SEPARATOR = re.compile(r"\n\n\[PAGE_NUMBER\]-{48}\n\n")
-SOURCE_DIR = Path("books")
+MODEL = "gpt-6-astra"
+MAX_SEARCH_ROUNDS = 3
+MAX_RESULTS_PER_SEARCH = 10
+MAX_GROUNDING_CHARS = 60_000
 
-INSTRUCTIONS = """
-You are a research assistant for the uploaded books. For questions that warrant
-research, search the files thoroughly, compare relevant passages, and give a
-comprehensive, well-organized answer. Distinguish what the authors say from
-your interpretation. Ground substantive claims about the books in retrieved
-material. If the retrieved material does not support a claim, say so. Do not
-claim to have searched an entire book unless the retrieval supports that claim.
-
-Do not invent page numbers, line numbers, quotations, or citation markers.
-The application will attach citations from API-provided retrieval metadata
-and independently verified local Markdown passages.
-"""
+# A page boundary is two newlines, [PAGE_NUMBER] plus 48 hyphens,
+# then two newlines. The number labels the page that follows it.
+PAGE_BOUNDARY = re.compile(r"\n\n(\d+)-{48}\n\n")
+CITATION = re.compile(r"\[\[([A-Za-z0-9_-]+)\]\]")
 
 
-def required_secret(name):
-    value = st.secrets.get(name)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"Missing required Streamlit secret: {name}")
-    return value.strip()
-
-
-def field(obj, name, default=None):
-    return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
-
-
-def source_lines(filename):
-    """Return (page, line, text) records from a local Markdown source."""
-    # Only use a basename supplied by the API; never follow a path from a result.
-    path = SOURCE_DIR / Path(filename).name
-    if not path.is_file() or path.suffix.lower() != ".md":
+def secret(name):
+    try:
+        value = st.secrets.get(name)
+    except Exception:
         return None
-
-    text = path.read_text(encoding="utf-8")
-    pages = PAGE_SEPARATOR.split(text)
-    return [
-        (page_number, line_number, line)
-        for page_number, page in enumerate(pages, start=1)
-        for line_number, line in enumerate(page.splitlines(), start=1)
-    ]
+    return value if isinstance(value, str) and value.strip() else None
 
 
-def verified_location(filename, passage):
-    """Locate a retrieved passage only when its text has one exact local match."""
-    if not passage or not passage.strip():
-        return None
+def page_label(text):
+    """Return a page only if the retrieved text establishes it unambiguously."""
+    matches = list(PAGE_BOUNDARY.finditer(text))
+    if len(matches) != 1:
+        return "page unknown"
 
-    records = source_lines(filename)
-    if records is None:
-        return None
-
-    # Match within a single page. Normalize whitespace, but do not use fuzzy
-    # matching: a plausible match is not sufficient for a line-level citation.
-    needle = " ".join(passage.split())
-    matches = []
-    pages = sorted({page for page, _, _ in records})
-    for page in pages:
-        page_records = [(line, text) for p, line, text in records if p == page]
-        for start in range(len(page_records)):
-            for end in range(start, len(page_records)):
-                candidate = " ".join(
-                    " ".join(text.split())
-                    for _, text in page_records[start : end + 1]
-                ).strip()
-                if candidate == needle:
-                    matches.append(
-                        (page, page_records[start][0], page_records[end][0])
-                    )
-                if len(candidate) > len(needle):
-                    break
-
-    return matches[0] if len(matches) == 1 else None
+    # A chunk spanning a boundary contains text from more than one page.
+    # Only a boundary at the start can label all substantive text in the chunk.
+    if text[: matches[0].start()].strip():
+        return "page unknown"
+    return f"page {matches[0].group(1)}"
 
 
-def citations_from_response(response):
-    """Collect API-provided file references; verify locations independently."""
-    sources = {}
+def result_field(result, name, default=None):
+    if isinstance(result, dict):
+        return result.get(name, default)
+    return getattr(result, name, default)
+
+
+def collect_chunks(response, chunks, seen):
+    """Collect only chunks whose text is exposed in file-search results."""
     for item in response.output:
-        if field(item, "type") == "file_search_call":
-            for result in field(item, "results", None) or []:
-                file_id = field(result, "file_id")
-                filename = field(result, "filename")
-                passage = field(result, "text")
-                if file_id and filename:
-                    sources.setdefault(file_id, {"filename": filename, "passages": []})
-                    if passage:
-                        sources[file_id]["passages"].append(passage)
+        if getattr(item, "type", None) != "file_search_call":
+            continue
+        for result in getattr(item, "results", None) or []:
+            text = result_field(result, "text")
+            if not isinstance(text, str) or not text.strip():
+                continue
 
-        if field(item, "type") == "message":
-            for content in field(item, "content", []) or []:
-                for annotation in field(content, "annotations", []) or []:
-                    if field(annotation, "type") == "file_citation":
-                        file_id = field(annotation, "file_id")
-                        filename = field(annotation, "filename")
-                        if file_id and filename:
-                            sources.setdefault(
-                                file_id, {"filename": filename, "passages": []}
-                            )
+            filename = result_field(result, "filename") or "Unknown file"
+            file_id = result_field(result, "file_id") or ""
+            key = (file_id, filename, text)
+            if key in seen:
+                continue
 
-    citations = []
-    for file_id, source in sources.items():
-        locations = {
-            location
-            for passage in source["passages"]
-            if (location := verified_location(source["filename"], passage))
-        }
-        if locations:
-            for page, first, last in sorted(locations):
-                citations.append(
-                    f"{source['filename']}, page {page}, lines {first}–{last}"
-                )
-        else:
-            citations.append(f"{source['filename']} (file-level citation)")
-    return citations
+            seen.add(key)
+            chunks.append(
+                {
+                    "id": f"B{len(chunks) + 1}",
+                    "filename": filename,
+                    "text": text,
+                    "page": page_label(text),
+                }
+            )
 
 
-st.title("📚 Book Research Assistant")
-st.write(
-    "Ask questions about books already uploaded to the configured OpenAI vector "
-    "store. Answers use file search. Page and line citations appear only when "
-    "retrieved passages can be uniquely verified against local Markdown files; "
-    "otherwise citations are labeled file-level."
-)
+def conversation_context(messages):
+    # Keep the full visible conversation, including earlier answers, so
+    # follow-up questions can refer to prior turns.
+    return "\n\n".join(
+        f"{message['role'].upper()}: {message['content']}"
+        for message in messages
+    )
 
-try:
-    app_password = required_secret("APP_PASSWORD")
-    api_key = required_secret("OPENAI_API_KEY")
-    vector_store_id = required_secret("OPENAI_VECTOR_STORE_ID")
-except ValueError as exc:
-    st.error(str(exc))
+
+def search_collection(client, vector_store_id, messages):
+    chunks = []
+    seen = set()
+    context = conversation_context(messages)
+
+    research_instructions = (
+        "You are researching a collection of books. Search relevant material "
+        "thoroughly, including passages that might qualify or conflict with an "
+        "initial finding. Distinguish the authors' claims from your analysis. "
+        "Do not assume one search is exhaustive. Return a brief research plan "
+        "or findings; the application will separately ground the final answer "
+        "in the retrieved chunks."
+    )
+
+    response = client.responses.create(
+        model=MODEL,
+        instructions=research_instructions,
+        input=context,
+        tools=[
+            {
+                "type": "file_search",
+                "vector_store_ids": [vector_store_id],
+                "max_num_results": MAX_RESULTS_PER_SEARCH,
+            }
+        ],
+        include=["file_search_call.results"],
+    )
+    collect_chunks(response, chunks, seen)
+
+    # Follow-up searches use the question and initial findings to look for
+    # corroboration, qualifications, and conflicting passages. These are
+    # additional retrieval attempts, not a guarantee of exhaustive coverage.
+    question = messages[-1]["content"]
+    findings = response.output_text or ""
+    for focus in (
+        "Find additional passages directly relevant to the question, "
+        "including definitions, context, and other parts of the books.",
+        "Find passages that qualify, contradict, or offer alternative "
+        "interpretations of the initial findings.",
+    )[: MAX_SEARCH_ROUNDS - 1]:
+        follow_up = client.responses.create(
+            model=MODEL,
+            instructions=(
+                "Use file_search to investigate the specified focus. "
+                "Search the collection rather than relying only on the "
+                "initial findings. Keep your response brief."
+            ),
+            input=(
+                f"Conversation:\n{context}\n\n"
+                f"Initial findings:\n{findings[:8_000]}\n\n"
+                f"Research focus: {focus}\n"
+                f"Current question: {question}"
+            ),
+            tools=[
+                {
+                    "type": "file_search",
+                    "vector_store_ids": [vector_store_id],
+                    "max_num_results": MAX_RESULTS_PER_SEARCH,
+                }
+            ],
+            include=["file_search_call.results"],
+        )
+        collect_chunks(follow_up, chunks, seen)
+
+    return chunks
+
+
+def grounding_material(chunks):
+    """Fit complete returned chunks into the explicit grounding prompt."""
+    selected = []
+    used = 0
+    for chunk in chunks:
+        entry = (
+            f"ID: {chunk['id']}\n"
+            f"Filename: {chunk['filename']}\n"
+            f"Page: {chunk['page']}\n"
+            f"Retrieved chunk text:\n{chunk['text']}\n"
+        )
+        if used + len(entry) > MAX_GROUNDING_CHARS:
+            continue
+        selected.append(chunk)
+        used += len(entry)
+    return selected
+
+
+def validate_answer(answer, chunks):
+    valid_ids = {chunk["id"] for chunk in chunks}
+    cited_ids = set(CITATION.findall(answer))
+    if not cited_ids.issubset(valid_ids):
+        return False
+
+    # Reject malformed citation-like tokens rather than displaying them.
+    without_valid_citations = CITATION.sub("", answer)
+    if "[[" in without_valid_citations or "]]" in without_valid_citations:
+        return False
+
+    return bool(cited_ids)
+
+
+def grounded_answer(client, messages, chunks):
+    selected = grounding_material(chunks)
+    if not selected:
+        return (
+            "I couldn’t access enough retrieved chunk text to give a "
+            "verifiable answer. Please try a narrower question.",
+            [],
+        )
+
+    sources = "\n\n".join(
+        f"ID: {chunk['id']}\n"
+        f"Filename: {chunk['filename']}\n"
+        f"Page: {chunk['page']}\n"
+        f"Text:\n{chunk['text']}"
+        for chunk in selected
+    )
+    instructions = (
+        "Answer the user's latest question using the supplied retrieved "
+        "chunks as evidence. Conduct a careful synthesis across relevant "
+        "chunks. Distinguish what an author says from your own analysis; "
+        "reconcile conflicting passages where possible and explain remaining "
+        "uncertainty. If the evidence is insufficient, say so. A retrieved "
+        "chunk may be only part of a page: never infer missing text, a page "
+        "number, a quotation, or a locator. Treat a page-boundary delimiter "
+        "as a boundary, not as proof that an incomplete chunk contains a "
+        "whole page.\n\n"
+        "CITATION FORMAT: Put [[B1]], [[B2]], etc. immediately after the "
+        "sentence or clause each chunk supports. Use only IDs supplied below. "
+        "For multiple supporting chunks, write adjacent markers such as "
+        "[[B1]][[B2]]. Cite substantive claims about the books. Do not cite "
+        "a chunk that does not support the claim. Do not use file-level "
+        "citation markers or invent IDs. If a claim lacks support, qualify "
+        "or omit it. Do not put citations inside code fences."
+    )
+    prompt = (
+        f"Conversation:\n{conversation_context(messages)}\n\n"
+        f"Retrieved chunks (the only citable sources):\n{sources}"
+    )
+
+    for attempt in range(2):
+        response = client.responses.create(
+            model=MODEL,
+            instructions=instructions,
+            input=prompt,
+        )
+        answer = (response.output_text or "").strip()
+        if validate_answer(answer, selected):
+            cited = set(CITATION.findall(answer))
+            return answer, [chunk for chunk in selected if chunk["id"] in cited]
+
+        prompt += (
+            "\n\nYour previous answer had missing, invalid, or malformed "
+            "chunk citations. Rewrite it using only the supplied IDs in "
+            "the exact [[B1]] format, adjacent to supported claims."
+        )
+
+    return (
+        "I found retrieved material, but couldn’t produce an answer with "
+        "validated block-level citations. Please try a narrower question.",
+        [],
+    )
+
+
+def show_message(message):
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if message["role"] == "assistant" and message.get("sources"):
+            with st.expander("Sources"):
+                for chunk in message["sources"]:
+                    st.markdown(
+                        f"**{chunk['id']} — {chunk['filename']} "
+                        f"({chunk['page']})**"
+                    )
+                    st.text(chunk["text"])
+
+
+st.title("📚 Research chatbot")
+
+expected_password = secret("APP_PASSWORD")
+api_key = secret("OPENAI_API_KEY")
+vector_store_id = secret("OPENAI_VECTOR_STORE_ID")
+
+if not all((expected_password, api_key, vector_store_id)):
+    st.error(
+        "App configuration is incomplete. Set APP_PASSWORD, OPENAI_API_KEY, "
+        "and OPENAI_VECTOR_STORE_ID in Streamlit secrets."
+    )
     st.stop()
 
 password = st.text_input("App password", type="password")
-if password != app_password:
-    if password:
-        st.error("Incorrect password.")
+if not password:
+    st.info("Enter the app password to continue.")
     st.stop()
 
-client = OpenAI(api_key=api_key, timeout=900.0)
+if not hashlib.compare_digest(password, expected_password):
+    st.error("Incorrect app password.")
+    st.stop()
+
+# Authentication has succeeded; only now create the client and show the chat.
+client = OpenAI(api_key=api_key)
+st.caption("Ask questions about the books in the existing research collection.")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        for citation in message.get("citations", []):
-            st.caption(citation)
+    show_message(message)
 
-if prompt := st.chat_input("Ask about the uploaded books"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    history = [
-        {"role": message["role"], "content": message["content"]}
-        for message in st.session_state.messages
+if prompt := st.chat_input("Ask a research question"):
+    pending_messages = st.session_state.messages + [
+        {"role": "user", "content": prompt}
     ]
+    show_message(pending_messages[-1])
 
     try:
-        with st.spinner("Searching the books…"):
-            response = client.with_options(timeout=900.0).responses.create(
-                model=MODEL,
-                instructions=INSTRUCTIONS,
-                input=history,
-                reasoning={"effort": "none"},
-			    text={"verbosity": "high"},
-                temperature=0,
-                max_output_tokens=32768,
-                tools=[
-                    {
-                        "type": "file_search",
-                        "vector_store_ids": [vector_store_id],
-                        "max_num_results": 50,
-                        "ranking_options": {"score_threshold": 0.5},
-                    }
-                ],
-                include=["file_search_call.results"],
-                service_tier="flex",
-            )
-        answer = response.output_text
-        citations = citations_from_response(response)
-        if not answer:
-            raise RuntimeError("The API returned no answer.")
-    except Exception as exc:
-        st.error(f"Research request failed: {exc}")
-    else:
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-            for citation in citations:
-                st.caption(citation)
-        st.session_state.messages.append(
-            {"role": "assistant", "content": answer, "citations": citations}
+        with st.spinner("Searching and checking sources…"):
+            chunks = search_collection(client, vector_store_id, pending_messages)
+            answer, sources = grounded_answer(client, pending_messages, chunks)
+    except Exception:
+        st.error(
+            "The research request failed. Please try again. "
+            "No assistant response was saved."
         )
+    else:
+        st.session_state.messages = pending_messages
+        assistant_message = {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+        }
+        st.session_state.messages.append(assistant_message)
+        show_message(assistant_message)

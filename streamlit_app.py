@@ -4,7 +4,7 @@ from pathlib import Path
 import streamlit as st
 from openai import OpenAI
 
-MODEL = "gpt-6-astra"
+MODEL = "gpt-6-sol"
 PAGE_SEPARATOR = re.compile(r"\n\n\[PAGE_NUMBER\]-{48}\n\n")
 SOURCE_DIR = Path("books")
 
@@ -145,7 +145,7 @@ if password != app_password:
         st.error("Incorrect password.")
     st.stop()
 
-client = OpenAI(api_key=api_key)
+client = OpenAI(api_key=api_key, timeout=900.0)
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -167,17 +167,24 @@ if prompt := st.chat_input("Ask about the uploaded books"):
 
     try:
         with st.spinner("Searching the books…"):
-            response = client.responses.create(
+            response = client.with_options(timeout=900.0).responses.create(
                 model=MODEL,
                 instructions=INSTRUCTIONS,
                 input=history,
+                reasoning={"effort": "none"},
+			    text={"verbosity": "high"},
+                temperature=0,
+                max_output_tokens=32768,
                 tools=[
                     {
                         "type": "file_search",
                         "vector_store_ids": [vector_store_id],
+                        "max_num_results": 50,
+                        "ranking_options": {"score_threshold": 0.5},
                     }
                 ],
                 include=["file_search_call.results"],
+                service_tier="flex",
             )
         answer = response.output_text
         citations = citations_from_response(response)

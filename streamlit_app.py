@@ -1,4 +1,4 @@
-import hashlib
+import hmac
 import re
 
 import streamlit as st
@@ -289,7 +289,7 @@ if not password:
     st.info("Enter the app password to continue.")
     st.stop()
 
-if not hashlib.compare_digest(password, expected_password):
+if not hmac.compare_digest(password, expected_password):
     st.error("Incorrect app password.")
     st.stop()
 

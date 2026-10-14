@@ -1,244 +1,195 @@
-import hashlib
-import hmac
 import re
+from pathlib import Path
 
 import streamlit as st
 from openai import OpenAI
 
+MODEL = "gpt-6-astra"
+PAGE_SEPARATOR = re.compile(r"\n\n\[PAGE_NUMBER\]-{48}\n\n")
+SOURCE_DIR = Path("books")
 
-MODEL = "gpt-6-sol"
+INSTRUCTIONS = """
+You are a research assistant for the uploaded books. For questions that warrant
+research, search the files thoroughly, compare relevant passages, and give a
+comprehensive, well-organized answer. Distinguish what the authors say from
+your interpretation. Ground substantive claims about the books in retrieved
+material. If the retrieved material does not support a claim, say so. Do not
+claim to have searched an entire book unless the retrieval supports that claim.
 
-SUPPORTED_SETTINGS = {
-    "standard": {"none", "low", "medium", "high", "xhigh", "max"},
-    "pro": {"none", "low", "medium", "high", "xhigh", "max"},
-}
-
-PAGE_MARKER_RE = re.compile(r"\n\n\[(\d+)\]-{48}\n\n")
-
-RESEARCH_INSTRUCTIONS = """
-You are a research analyst working primarily from the uploaded Markdown books.
-
-For substantive research questions, use file_search. Give comprehensive,
-carefully reasoned answers grounded in retrieved evidence. Distinguish what
-the books say from your own interpretation or synthesis. Identify material
-gaps, uncertainty, and disagreements between sources.
-
-Cite the relevant retrieved files close to the claims they support. Include
-short, relevant quotations when the retrieved text lets you verify their
-exact wording and attribution. Never invent a quotation, page number, line
-number, or source.
-
-The books use page-boundary markers consisting of two newlines, a bracketed
-page number, 48 hyphens, and two newlines. These are metadata, not prose.
-A retrieved excerpt may cross a boundary. Give a page number only when the
-retrieved evidence unambiguously establishes that the cited passage is on
-that page. Otherwise cite the file without a page number. If the available
-retrieved text cannot verify a quotation, paraphrase instead.
-
-Use the file-search citation annotations supplied by the API. Do not invent
-citation markers or claim that a citation links to a particular page.
+Do not invent page numbers, line numbers, quotations, or citation markers.
+The application will attach citations from API-provided retrieval metadata
+and independently verified local Markdown passages.
 """
 
 
-def required_secret(name: str) -> str:
-    try:
-        value = st.secrets[name]
-    except (KeyError, FileNotFoundError):
-        st.error(
-            f"Missing configuration: {name}. Add it to "
-            "./.streamlit/secrets.toml and restart the app."
-        )
-        st.stop()
-
+def required_secret(name):
+    value = st.secrets.get(name)
     if not isinstance(value, str) or not value.strip():
-        st.error(f"Configuration error: {name} must be a non-empty string.")
-        st.stop()
-
-    return value
+        raise ValueError(f"Missing required Streamlit secret: {name}")
+    return value.strip()
 
 
-def session_fingerprint(password: str, vector_store_id: str) -> str:
-    """Identify this authenticated session without storing its password."""
-    return hashlib.sha256(
-        (password + "\0" + vector_store_id).encode("utf-8")
-    ).hexdigest()
+def field(obj, name, default=None):
+    return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
 
 
-def response_text_and_sources(response):
-    """Extract answer text and API-provided file citation annotations."""
-    text_parts = []
-    sources = []
-    seen = set()
+def source_lines(filename):
+    """Return (page, line, text) records from a local Markdown source."""
+    # Only use a basename supplied by the API; never follow a path from a result.
+    path = SOURCE_DIR / Path(filename).name
+    if not path.is_file() or path.suffix.lower() != ".md":
+        return None
 
-    for item in response.output:
-        if getattr(item, "type", None) != "message":
-            continue
+    text = path.read_text(encoding="utf-8")
+    pages = PAGE_SEPARATOR.split(text)
+    return [
+        (page_number, line_number, line)
+        for page_number, page in enumerate(pages, start=1)
+        for line_number, line in enumerate(page.splitlines(), start=1)
+    ]
 
-        for content in getattr(item, "content", []):
-            if getattr(content, "type", None) != "output_text":
-                continue
 
-            text_parts.append(content.text)
-            for annotation in getattr(content, "annotations", []) or []:
-                if getattr(annotation, "type", None) != "file_citation":
-                    continue
+def verified_location(filename, passage):
+    """Locate a retrieved passage only when its text has one exact local match."""
+    if not passage or not passage.strip():
+        return None
 
-                file_id = getattr(annotation, "file_id", None)
-                filename = getattr(annotation, "filename", None)
-                key = (file_id, filename)
-                if key not in seen:
-                    seen.add(key)
-                    sources.append(
-                        {
-                            "file_id": file_id,
-                            "filename": filename or "Untitled file",
-                        }
+    records = source_lines(filename)
+    if records is None:
+        return None
+
+    # Match within a single page. Normalize whitespace, but do not use fuzzy
+    # matching: a plausible match is not sufficient for a line-level citation.
+    needle = " ".join(passage.split())
+    matches = []
+    pages = sorted({page for page, _, _ in records})
+    for page in pages:
+        page_records = [(line, text) for p, line, text in records if p == page]
+        for start in range(len(page_records)):
+            for end in range(start, len(page_records)):
+                candidate = " ".join(
+                    " ".join(text.split())
+                    for _, text in page_records[start : end + 1]
+                ).strip()
+                if candidate == needle:
+                    matches.append(
+                        (page, page_records[start][0], page_records[end][0])
                     )
+                if len(candidate) > len(needle):
+                    break
 
-    return "\n".join(text_parts).strip(), sources
-
-
-def display_answer(text: str, sources: list[dict]):
-    # File-search citation markers are API presentation tokens, not prose.
-    # Streamlit Markdown does not resolve them into clickable file citations.
-    # Remove only the known file-citation token shape; retain the API's
-    # annotation metadata in the source list below.
-    clean_text = re.sub(r"filecite[^]+", "", text)
-    st.markdown(clean_text)
-
-    if sources:
-        st.caption(
-            "Cited files: "
-            + "; ".join(
-                f"{source['filename']} ({source['file_id']})"
-                for source in sources
-            )
-        )
-        st.caption(
-            "These citations identify uploaded files. This app cannot link "
-            "directly to a book page from the file-search annotations."
-        )
+    return matches[0] if len(matches) == 1 else None
 
 
-def create_research_response(
-    client: OpenAI,
-    messages: list[dict],
-    vector_store_id: str,
-    mode: str,
-    effort: str,
-):
-    if effort not in SUPPORTED_SETTINGS.get(mode, set()):
-        raise ValueError("Unsupported research mode and reasoning effort.")
+def citations_from_response(response):
+    """Collect API-provided file references; verify locations independently."""
+    sources = {}
+    for item in response.output:
+        if field(item, "type") == "file_search_call":
+            for result in field(item, "results", None) or []:
+                file_id = field(result, "file_id")
+                filename = field(result, "filename")
+                passage = field(result, "text")
+                if file_id and filename:
+                    sources.setdefault(file_id, {"filename": filename, "passages": []})
+                    if passage:
+                        sources[file_id]["passages"].append(passage)
 
-    return client.with_options(timeout=900.0).responses.create(
-        model=MODEL,
-        instructions=RESEARCH_INSTRUCTIONS,
-        input=messages,
-        reasoning={
-            "mode": mode,
-            "effort": effort,
-        },
-        text={"verbosity": "high"},
-        temperature=0 if mode == "none" else 1,
-        tools=[
-            {
-                "type": "file_search",
-                "vector_store_ids": [vector_store_id],
-            }
-        ],
-        include=["file_search_call.results"],
-        service_tier="flex",
-    )
+        if field(item, "type") == "message":
+            for content in field(item, "content", []) or []:
+                for annotation in field(content, "annotations", []) or []:
+                    if field(annotation, "type") == "file_citation":
+                        file_id = field(annotation, "file_id")
+                        filename = field(annotation, "filename")
+                        if file_id and filename:
+                            sources.setdefault(
+                                file_id, {"filename": filename, "passages": []}
+                            )
+
+    citations = []
+    for file_id, source in sources.items():
+        locations = {
+            location
+            for passage in source["passages"]
+            if (location := verified_location(source["filename"], passage))
+        }
+        if locations:
+            for page, first, last in sorted(locations):
+                citations.append(
+                    f"{source['filename']}, page {page}, lines {first}–{last}"
+                )
+        else:
+            citations.append(f"{source['filename']} (file-level citation)")
+    return citations
 
 
-st.title("📚 Book-Grounded Research Chat")
+st.title("📚 Book Research Assistant")
 st.write(
-    "Ask detailed questions about the uploaded books. Answers use hosted "
-    "file search and identify the files supporting their claims."
+    "Ask questions about books already uploaded to the configured OpenAI vector "
+    "store. Answers use file search. Page and line citations appear only when "
+    "retrieved passages can be uniquely verified against local Markdown files; "
+    "otherwise citations are labeled file-level."
 )
 
-app_password = required_secret("APP_PASSWORD")
-api_key = required_secret("OPENAI_API_KEY")
-vector_store_id = required_secret("VECTOR_STORE_ID")
-
-entered_password = st.text_input("App password", type="password")
-
-if not entered_password:
-    st.info("Enter the app password to begin.")
+try:
+    app_password = required_secret("APP_PASSWORD")
+    api_key = required_secret("OPENAI_API_KEY")
+    vector_store_id = required_secret("OPENAI_VECTOR_STORE_ID")
+except ValueError as exc:
+    st.error(str(exc))
     st.stop()
 
-if not hmac.compare_digest(entered_password, app_password):
-    st.error("Incorrect password.")
+password = st.text_input("App password", type="password")
+if password != app_password:
+    if password:
+        st.error("Incorrect password.")
     st.stop()
 
-mode = st.selectbox("Reasoning mode", ["standard", "pro"])
-effort = st.selectbox(
-    "Reasoning effort",
-    ["none", "low", "medium", "high", "xhigh", "max"],
-    index=2,
-)
-
-fingerprint = session_fingerprint(entered_password, vector_store_id)
-settings = (MODEL, mode, effort, vector_store_id)
-
-if (
-    st.session_state.get("research_session") != fingerprint
-    or st.session_state.get("research_settings") != settings
-):
-    st.session_state.research_session = fingerprint
-    st.session_state.research_settings = settings
+client = OpenAI(api_key=api_key)
+if "messages" not in st.session_state:
     st.session_state.messages = []
-
-if effort not in SUPPORTED_SETTINGS.get(mode, set()):
-    st.warning(
-        f"{MODEL} does not support reasoning effort '{effort}' in the "
-        "configured compatibility table. Choose a supported effort."
-    )
-    st.stop()
-
-client = OpenAI(api_key=api_key, timeout=900.0)
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        if message["role"] == "assistant":
-            display_answer(message["content"], message.get("sources", []))
-        else:
-            st.markdown(message["content"])
+        st.markdown(message["content"])
+        for citation in message.get("citations", []):
+            st.caption(citation)
 
-if prompt := st.chat_input("Ask a research question about the books"):
+if prompt := st.chat_input("Ask about the uploaded books"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    request_messages = [
+    history = [
         {"role": message["role"], "content": message["content"]}
         for message in st.session_state.messages
     ]
-    request_messages.append({"role": "user", "content": prompt})
 
     try:
-        with st.spinner("Searching the books and preparing an answer…"):
-            response = create_research_response(
-                client, request_messages, vector_store_id, mode, effort
+        with st.spinner("Searching the books…"):
+            response = client.responses.create(
+                model=MODEL,
+                instructions=INSTRUCTIONS,
+                input=history,
+                tools=[
+                    {
+                        "type": "file_search",
+                        "vector_store_ids": [vector_store_id],
+                    }
+                ],
+                include=["file_search_call.results"],
             )
-            answer, sources = response_text_and_sources(response)
-            if not answer:
-                raise RuntimeError("The API returned no answer text.")
-    except Exception:
-        # Do not display exception text: it may contain request details.
-        st.error(
-            "The research request failed. Check the app configuration, "
-            "model access, and vector-store availability in server logs."
-        )
+        answer = response.output_text
+        citations = citations_from_response(response)
+        if not answer:
+            raise RuntimeError("The API returned no answer.")
+    except Exception as exc:
+        st.error(f"Research request failed: {exc}")
     else:
-        st.session_state.messages.append(
-            {"role": "user", "content": prompt}
-        )
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": answer,
-                "sources": sources,
-            }
-        )
         with st.chat_message("assistant"):
-            display_answer(answer, sources)
+            st.markdown(answer)
+            for citation in citations:
+                st.caption(citation)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer, "citations": citations}
+        )

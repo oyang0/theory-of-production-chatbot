@@ -7,7 +7,7 @@ from openai import OpenAI
 MODEL = "gpt-6-sol"
 MAX_SEARCH_ROUNDS = 3
 MAX_RESULTS_PER_SEARCH = 50
-SCORE_THRESHOLD = 0.5
+SCORE_THRESHOLD = 0.25
 MAX_GROUNDING_CHARS = 60_000
 
 # A page boundary is two newlines, [PAGE_NUMBER] plus 48 hyphens,

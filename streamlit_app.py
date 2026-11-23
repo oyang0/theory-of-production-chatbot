@@ -125,7 +125,7 @@ def search_collection(client, vector_store_id, messages):
         "Find passages that qualify, contradict, or offer alternative "
         "interpretations of the initial findings.",
     )[: MAX_SEARCH_ROUNDS - 1]:
-        follow_up = client.responses.create(
+        follow_up = client.with_options(timeout=900.0).responses.create(
             model=MODEL,
             instructions=(
                 "Use file_search to investigate the specified focus. "
@@ -230,7 +230,7 @@ def grounded_answer(client, messages, chunks):
     )
 
     for _ in range(2):
-        response = client.responses.create(
+        response = client.with_options(timeout=900.0).responses.create(
             model=MODEL,
             instructions=instructions,
             input=prompt,
